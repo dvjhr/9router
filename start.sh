@@ -1,4 +1,9 @@
-docker stop 9router
-docker rm 9router
-docker build -t 9router .
-docker run -d --name 9router -p 20128:20128 --env-file .env -v 9router-data:/app/data 9router
+#!/bin/bash
+export NODE_ENV="production"
+export PORT="20128"
+export HOSTNAME="0.0.0.0"
+export DATA_DIR="$HOME/.9router"
+export INITIAL_PASSWORD="1029384756"
+export JWT_SECRET="mntbdjw-9router"
+
+npm run start

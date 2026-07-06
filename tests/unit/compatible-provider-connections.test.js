@@ -1,42 +1,33 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { NextResponse } from "next/server";
+import {
+  getProviderConnections,
+  createProviderConnection,
+  getProviderNodeById,
+  getProviderNodes,
+  getProxyPoolById,
+} from "@/models";
+import { APIKEY_PROVIDERS } from "@/shared/constants/config";
+import { AI_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isCustomEmbeddingProvider } from "@/shared/constants/providers";
+import { normalizeProviderId, normalizeProviderSpecificData } from "@/lib/providerNormalization";
 
-const originalDataDir = process.env.DATA_DIR;
+export const dynamic = "force-dynamic";
 
-async function setupTestContext(nodeData) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "9router-compatible-provider-"));
-  process.env.DATA_DIR = tempDir;
-  vi.resetModules();
-  vi.doMock("next/server", () => ({
-    NextResponse: {
-      json(body, init = {}) {
-        return new Response(JSON.stringify(body), {
-          status: init.status || 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      },
-    },
-  }));
+function normalizeProxyConfig(body = {}) {
+  const enabled = body?.connectionProxyEnabled === true;
+  const url = typeof body?.connectionProxyUrl === "string" ? body.connectionProxyUrl.trim() : "";
+  const noProxy = typeof body?.connectionNoProxy === "string" ? body.connectionNoProxy.trim() : "";
 
-  const { POST } = await import("@/app/api/providers/route.js");
-  const {
-    createProviderNode,
-    getProviderConnections,
-  } = await import("@/models/index.js");
-
-  const node = await createProviderNode(nodeData);
+  if (enabled && !url) {
+    return { error: "Connection proxy URL is required when connection proxy is enabled" };
+  }
 
   return {
-    node,
-    POST,
-    getProviderConnections,
-    cleanup() {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    },
+    connectionProxyEnabled: enabled,
+    connectionProxyUrl: url,
+    connectionNoProxy: noProxy,
   };
 }
+
 
 function makeRequest(provider, name = "Test Connection") {
   return new Request("https://9router.local/api/providers", {
@@ -49,72 +40,176 @@ function makeRequest(provider, name = "Test Connection") {
       defaultModel: "test-model",
     }),
   });
+
+async function normalizeProxyPoolId(proxyPoolId) {
+  if (proxyPoolId === undefined || proxyPoolId === null || proxyPoolId === "" || proxyPoolId === "__none__") {
+    return { proxyPoolId: null };
+  }
+
+  const normalizedId = String(proxyPoolId).trim();
+  if (!normalizedId) {
+    return { proxyPoolId: null };
+  }
+
+  const proxyPool = await getProxyPoolById(normalizedId);
+  if (!proxyPool) {
+    return { error: "Proxy pool not found" };
+  }
+
+  return { proxyPoolId: normalizedId };
+
 }
 
-function expectCompatibleConnection(connection, node, { apiType } = {}) {
-  expect(connection.provider).toBe(node.id);
-  expect(connection.authType).toBe("apikey");
-  expect(connection.defaultModel).toBe("test-model");
-  expect(connection.providerSpecificData).toMatchObject({
-    prefix: node.prefix,
-    baseUrl: node.baseUrl,
-    nodeName: node.name,
-  });
+// GET /api/providers - List all connections
+export async function GET() {
+  try {
+    const connections = await getProviderConnections();
 
-  if (apiType !== undefined) {
-    expect(connection.providerSpecificData.apiType).toBe(apiType);
+    // Build nodeNameMap for compatible providers (id → name)
+    let nodeNameMap = {};
+    try {
+      const nodes = await getProviderNodes();
+      for (const node of nodes) {
+        if (node.id && node.name) nodeNameMap[node.id] = node.name;
+      }
+    } catch { }
+
+    // Hide sensitive fields, enrich name for compatible providers
+    const safeConnections = connections.map(c => {
+      const isCompatible = isOpenAICompatibleProvider(c.provider) || isAnthropicCompatibleProvider(c.provider);
+      const name = isCompatible
+        ? (c.name || nodeNameMap[c.provider] || c.providerSpecificData?.nodeName || c.provider)
+        : c.name;
+      return {
+        ...c,
+        name,
+        apiKey: undefined,
+        accessToken: undefined,
+        refreshToken: undefined,
+        idToken: undefined,
+      };
+    });
+
+    return NextResponse.json({ connections: safeConnections });
+  } catch (error) {
+    console.log("Error fetching providers:", error);
+    return NextResponse.json({ error: "Failed to fetch providers" }, { status: 500 });
   }
 }
 
-describe("compatible provider connections API", () => {
-  let cleanup = () => {};
+// POST /api/providers - Create new connection (API Key only, OAuth via separate flow)
+export async function POST(request) {
+  try {
+    const body = await request.json();
+    const provider = normalizeProviderId(body.provider);
+    const { apiKey, name, displayName, priority, globalPriority, defaultModel, testStatus } = body;
+    const proxyConfig = normalizeProxyConfig(body);
+    if (proxyConfig.error) {
+      return NextResponse.json({ error: proxyConfig.error }, { status: 400 });
+    }
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+    const proxyPoolResult = await normalizeProxyPoolId(body.proxyPoolId);
+    if (proxyPoolResult.error) {
+      return NextResponse.json({ error: proxyPoolResult.error }, { status: 400 });
+    }
+    const proxyPoolId = proxyPoolResult.proxyPoolId;
 
-  afterEach(() => {
-    vi.doUnmock("next/server");
-    vi.resetModules();
-    vi.clearAllMocks();
-    cleanup();
-    cleanup = () => {};
-    if (originalDataDir === undefined) delete process.env.DATA_DIR;
-    else process.env.DATA_DIR = originalDataDir;
-  });
+    // Validation
+    const isWebCookieProvider = !!WEB_COOKIE_PROVIDERS[provider];
+    // Dual-auth providers (e.g. codebuddy-cn, xai) live under category "oauth" but also
+    // accept an API key via authModes — they aren't in APIKEY_PROVIDERS, so allow them here.
+    const supportsApiKeyMode = !!AI_PROVIDERS[provider]?.authModes?.includes("apikey");
+    const isValidProvider = APIKEY_PROVIDERS[provider] ||
+      FREE_TIER_PROVIDERS[provider] ||
+      supportsApiKeyMode ||
+      isWebCookieProvider ||
+      isOpenAICompatibleProvider(provider) ||
+      isAnthropicCompatibleProvider(provider) ||
+      isCustomEmbeddingProvider(provider);
 
-  it("creates one API-key connection for an OpenAI-compatible node", async () => {
-    const ctx = await setupTestContext({
-      id: "openai-compatible-test",
-      type: "openai-compatible",
-      name: "OpenAI Compatible Test Node",
-      prefix: "oct",
-      apiType: "chat",
-      baseUrl: "https://openai-compatible.test/v1",
+    if (!provider || !isValidProvider) {
+      return NextResponse.json({ error: "Invalid provider" }, { status: 400 });
+    }
+    if (!apiKey && provider !== "ollama-local") {
+      return NextResponse.json({ error: `${isWebCookieProvider ? "Cookie value" : "API Key"} is required` }, { status: 400 });
+    }
+    const connectionName = name || displayName || AI_PROVIDERS[provider]?.name;
+    if (!connectionName) {
+      return NextResponse.json({ error: "Name is required" }, { status: 400 });
+    }
+
+    let providerSpecificData = normalizeProviderSpecificData(provider, body, body.providerSpecificData);
+
+    // Compatible/embedding nodes now allow multiple connections for load balancing.
+    if (isOpenAICompatibleProvider(provider)) {
+      const node = await getProviderNodeById(provider);
+      if (!node) {
+        return NextResponse.json({ error: "OpenAI Compatible node not found" }, { status: 404 });
+      }
+      providerSpecificData = {
+        prefix: node.prefix,
+        apiType: node.apiType,
+        baseUrl: node.baseUrl,
+        nodeName: node.name,
+      };
+    } else if (isAnthropicCompatibleProvider(provider)) {
+      const node = await getProviderNodeById(provider);
+      if (!node) {
+        return NextResponse.json({ error: "Anthropic Compatible node not found" }, { status: 404 });
+      }
+      providerSpecificData = {
+        prefix: node.prefix,
+        baseUrl: node.baseUrl,
+        nodeName: node.name,
+      };
+    } else if (isCustomEmbeddingProvider(provider)) {
+      const node = await getProviderNodeById(provider);
+      if (!node) {
+        return NextResponse.json({ error: "Custom Embedding node not found" }, { status: 404 });
+      }
+      providerSpecificData = {
+        prefix: node.prefix,
+        baseUrl: node.baseUrl,
+        nodeName: node.name,
+      };
+    }
+
+    const mergedProviderSpecificData = {
+      ...(providerSpecificData || {}),
+      connectionProxyEnabled: proxyConfig.connectionProxyEnabled,
+      connectionProxyUrl: proxyConfig.connectionProxyUrl,
+      connectionNoProxy: proxyConfig.connectionNoProxy,
+    };
+
+    if (proxyPoolId !== null) {
+      mergedProviderSpecificData.proxyPoolId = proxyPoolId;
+    }
+
+    const newConnection = await createProviderConnection({
+      provider,
+      authType: isWebCookieProvider ? "cookie" : "apikey",
+      name: connectionName,
+      apiKey: apiKey || "",
+      priority: priority || 1,
+      globalPriority: globalPriority || null,
+      defaultModel: defaultModel || null,
+      providerSpecificData: mergedProviderSpecificData,
+      isActive: true,
+      testStatus: testStatus || "unknown",
     });
-    cleanup = ctx.cleanup;
 
-    const response = await ctx.POST(makeRequest(ctx.node.id));
-    const body = await response.json();
-    const connection = body.connection;
-    const storedConnections = await ctx.getProviderConnections({ provider: ctx.node.id });
+    // Hide sensitive fields
+    const result = { ...newConnection };
+    delete result.apiKey;
 
-    expect(response.status).toBe(201);
-    expect(storedConnections).toHaveLength(1);
-    expectCompatibleConnection(connection, ctx.node, { apiType: "chat" });
-    expect(storedConnections[0]).toMatchObject({
-      provider: ctx.node.id,
-      authType: "apikey",
-      defaultModel: "test-model",
-      providerSpecificData: {
-        prefix: ctx.node.prefix,
-        apiType: "chat",
-        baseUrl: ctx.node.baseUrl,
-        nodeName: ctx.node.name,
-      },
-    });
-  });
+    return NextResponse.json({ connection: result }, { status: 201 });
+  } catch (error) {
+    console.log("Error creating provider:", error);
+    return NextResponse.json({ error: "Failed to create provider" }, { status: 500 });
+  }
+}
 
+<<<<<<< HEAD
   it("creates one API-key connection for an Anthropic-compatible node", async () => {
     const ctx = await setupTestContext({
       id: "anthropic-compatible-test",
@@ -167,3 +262,5 @@ describe("compatible provider connections API", () => {
     expectCompatibleConnection(storedConnections[1], ctx.node, { apiType: "chat" });
   });
 });
+=======
+>>>>>>> f32de15 (Initial commit. Modify add bulk key)
